@@ -1,0 +1,958 @@
+// ==============================================================================
+// 1. IMPORTAÇÕES
+// ==============================================================================
+
+// -------------------------
+// Flutter SDK
+// -------------------------
+import 'package:flutter/material.dart';
+import 'package:flutter/services.dart' show rootBundle;
+
+// -------------------------
+// Pacotes de Terceiros (pub.dev)
+// -------------------------
+import 'package:intl/intl.dart';
+import 'package:pdf/widgets.dart' as pw;
+import 'package:path_provider/path_provider.dart';
+import 'package:http/http.dart' as http; // ← MOVER para cá
+import 'package:supabase_flutter/supabase_flutter.dart';
+import 'package:url_launcher/url_launcher.dart';
+import 'dart:convert';
+import 'package:flutter/foundation.dart'; // ← Para kIsWeb
+// Para Uint8List
+
+// -------------------------
+// Bibliotecas Dart Internas
+// -------------------------
+import 'dart:io';
+
+// -------------------------
+// Arquivos Locais do Projeto
+// -------------------------
+import '../models/pedido.dart';
+import '../services/supabase_service.dart';
+
+// ==============================================================================
+// 2. DECLARAÇÃO DA TELA (WIDGET)
+// ==============================================================================
+/// Tela principal: Lista de pedidos com status 'entregue'
+///
+/// Funcionalidades:
+/// - Visualização de pedidos
+/// - Seleção com checkbox
+/// - Filtros por entregador, loja, status
+/// - Geração de recibo em PDF
+class PedidosEntreguesScreen extends StatefulWidget {
+  const PedidosEntreguesScreen({super.key});
+
+  @override
+  State<PedidosEntreguesScreen> createState() => _PedidosEntreguesScreenState();
+}
+
+// ==============================================================================
+// 3. ESTADO DA TELA (LÓGICA)
+// ==============================================================================
+/// Estado da tela 'Pedidos Entregues'
+///
+/// Gerencia:
+/// - Carregamento de dados
+/// - Filtros
+/// - Seleção de pedidos
+/// - Cálculo de totais
+/// - Geração de PDF
+class _PedidosEntreguesScreenState extends State<PedidosEntreguesScreen> {
+  // -------------------------------------------------------------------------
+  // 3.2 DADOS DOS PEDIDOS
+  // -------------------------------------------------------------------------
+  /// Lista de todos os pedidos carregados do Supabase
+  List<Pedido> _pedidos = [];
+
+  /// Indica se está carregando dados do Supabase
+  bool _isLoading = false;
+
+  /// Data de pagamento (usada no filtro e atualização em massa)
+  late DateTime _dataPagamento;
+
+  // -------------------------------------------------------------------------
+  // 3.3 SELEÇÃO DE PEDIDOS
+  // -------------------------------------------------------------------------
+  /// Conjunto de IDs dos pedidos selecionados (evita duplicados)
+  final _pedidosSelecionados = <int>{};
+
+  // -------------------------------------------------------------------------
+  // 3.4 CÁLCULO DE TOTAIS
+  // -------------------------------------------------------------------------
+
+  /// Soma apenas dos pedidos selecionados
+  double _totalSelecionados = 0.0;
+
+  // -------------------------------------------------------------------------
+  // 3.5 CONTROLES DE EDIÇÃO (TextEditingController)
+  // -------------------------------------------------------------------------
+  /// Controlador para o campo de filtro por entregador
+  final _filtroEntregador = TextEditingController();
+
+  /// Controlador para o campo de filtro por loja
+  final _filtroLoja = TextEditingController();
+
+  /// Controlador para o campo de filtro por status de pagamento
+  final _filtroStatus = TextEditingController();
+
+  /// Controlador para o campo de data de pagamento (exibe dd/MM/yyyy)
+  final _dataPagamentoController = TextEditingController();
+
+  /// Mapa de controladores para edição do valor de frete por pedido
+  final Map<int, TextEditingController> _freteControllers = {};
+
+  // -------------------------------------------------------------------------
+  // 3.6 INICIALIZAÇÃO
+  // -------------------------------------------------------------------------
+  @override
+  void initState() {
+    super.initState();
+    _dataPagamento = DateTime.now();
+    _dataPagamentoController.text = DateFormat(
+      'dd/MM/yyyy',
+    ).format(_dataPagamento);
+    _carregarPedidos().then((_) {
+      // DEBUG TEMPORÁRIO - remova depois de resolver
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        _debugLojas();
+      });
+    });
+  }
+
+  // DEBUG TEMPORÁRIO - remova este método depois de resolver o problema
+  void _debugLojas() {
+    debugPrint('=== DEBUG LOJAS ===');
+    for (var pedido in _pedidos) {
+      debugPrint('ID: ${pedido.idLoja}, Nome: ${pedido.lojaNome}');
+    }
+    debugPrint('===================');
+  }
+
+  // -------------------------------------------------------------------------
+  // 3.7 MÉTODO: CARREGAR PEDIDOS DO SUPABASE
+  // -------------------------------------------------------------------------
+  /// Carrega os pedidos com status 'entregue' do Supabase
+  Future<void> _carregarPedidos() async {
+    setState(() {
+      _isLoading = true;
+      _filtroLoja.text = ''; // ✅ Resetar filtro ao recarregar
+      _filtroEntregador.text = '';
+      _filtroStatus.text = '';
+      _pedidosSelecionados.clear(); // ✅ Limpar seleção ao recarregar
+    });
+
+    try {
+      final supabase = SupabaseService();
+      final response = await supabase.getPedidosEntregues();
+      _pedidos = response.map((json) => Pedido.fromJson(json)).toList();
+      _calcularTotais();
+
+      // ✅ DEBUG: Verificar se há duplicatas reais
+      _verificarDuplicatasLojas();
+    } catch (e) {
+      if (mounted) {
+        ScaffoldMessenger.of(
+          context,
+        ).showSnackBar(SnackBar(content: Text('Erro ao carregar pedidos: $e')));
+      }
+    } finally {
+      setState(() {
+        _isLoading = false;
+      });
+    }
+  }
+
+  // -------------------------------------------------------------------------
+  // MÉTODO AUXILIAR: VERIFICAR DUPLICATAS REAIS
+  // -------------------------------------------------------------------------
+  void _verificarDuplicatasLojas() {
+    final idsVistos = <String>{};
+    final duplicatas = <String>[];
+
+    for (final pedido in _pedidos) {
+      if (idsVistos.contains(pedido.idLoja)) {
+        duplicatas.add('ID: ${pedido.idLoja}, Nome: ${pedido.lojaNome}');
+      }
+      idsVistos.add(pedido.idLoja);
+    }
+
+    if (duplicatas.isNotEmpty) {
+      debugPrint('⚠️ DUPLICATAS REAIS ENCONTRADAS:');
+      for (final dup in duplicatas) {
+        debugPrint('   $dup');
+      }
+    }
+  }
+
+  // -------------------------------------------------------------------------
+  // 3.8 MÉTODO: OBTER CONTROLADOR DE FRETE
+  // -------------------------------------------------------------------------
+  /// Retorna o controlador de texto para o frete de um pedido
+  ///
+  /// Cria um novo controlador se ainda não existir
+  TextEditingController _getFreteController(Pedido pedido) {
+    if (!_freteControllers.containsKey(pedido.id)) {
+      final controller = TextEditingController();
+      // Inicialize com valor padrão se disponível, ex: pedido.fretePago ou 0.0
+      controller.text = pedido.fretePago?.toStringAsFixed(2) ?? '0.00';
+      _freteControllers[pedido.id] = controller;
+    }
+    return _freteControllers[pedido.id]!;
+  }
+
+  // -------------------------------------------------------------------------
+  // 3.9 MÉTODO: CALCULAR TOTAIS
+  // -------------------------------------------------------------------------
+  /// Recalcula o total geral e o total dos selecionados
+  ///
+  /// - Total Geral: soma de todos os pedidos (usando `pedido.total`)
+  /// - Total Selecionados: soma dos valores de `fretePago` dos pedidos selecionados
+  void _calcularTotais() {
+    // ✅ Total Geral: continua usando `pedido.total`
+
+    // ✅ Total Selecionados: soma apenas os valores de `fretePago` dos pedidos selecionados
+    _totalSelecionados = _pedidos
+        .where((pedido) => _pedidosSelecionados.contains(pedido.id))
+        .fold(
+          0.0,
+          (sum, pedido) =>
+              sum + (double.tryParse(_getFreteController(pedido).text) ?? 0.0),
+        );
+  }
+
+  // -------------------------------------------------------------------------
+  // 3.10 MÉTODO: ATUALIZAR PEDIDOS SELECIONADOS
+  // -------------------------------------------------------------------------
+  /// Atualiza os pedidos selecionados no Supabase
+  ///
+  /// - Atualiza: frete_pago, status_pagamento, data_pagamento
+  /// - Se frete_pago for 0, status_pagamento vira false (pendente)
+  /// - Usa a data selecionada acima
+  Future<void> _atualizarPedidos() async {
+    if (_pedidosSelecionados.isEmpty) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text('Nenhum pedido selecionado para atualizar.'),
+          ),
+        );
+      }
+      return;
+    }
+
+    try {
+      final supabase = Supabase.instance.client;
+
+      for (var id in _pedidosSelecionados) {
+        final pedido = _pedidos.firstWhere((p) => p.id == id);
+
+        // Lê o valor do campo de frete
+        final fretePago =
+            double.tryParse(_getFreteController(pedido).text) ?? 0.0;
+
+        // Define status_pagamento: true se fretePago > 0, false se for 0
+        final statusPagamento = fretePago > 0;
+
+        // Prepara os dados para atualizar
+        final dados = {
+          'frete_pago': fretePago,
+          'status_pagamento': statusPagamento,
+          'data_pagamento': _dataPagamento.toIso8601String().split('T').first,
+        };
+
+        //⚠️ Não verifique `response.error` — o Supabase lança exceção se falhar
+        await supabase.from('pedidos').update(dados).eq('id', id);
+      }
+
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('Pedidos atualizados com sucesso!')),
+        );
+      }
+
+      // Recarrega os dados
+      await _carregarPedidos();
+    } catch (e) {
+      if (mounted) {
+        // ✅ Mostra o erro real
+        ScaffoldMessenger.of(
+          context,
+        ).showSnackBar(SnackBar(content: Text('Erro ao salvar: $e')));
+      }
+    }
+  }
+
+  // -------------------------------------------------------------------------
+  // 3.11 MÉTODO: OBTER LOJAS ÚNICAS (VERSÃO TOLERANTE A DUPLICATAS)
+  // -------------------------------------------------------------------------
+  List<Map<String, String>> get _lojasUnicas {
+    final Map<String, String> lojasMap = {};
+    final idsProcessados = <String>{}; // ✅ Controlar IDs únicos
+
+    for (final pedido in _pedidos) {
+      final id = pedido.idLoja;
+      final nome = pedido.lojaNome;
+
+      // ✅ Ignorar se já processamos este ID
+      if (!idsProcessados.contains(id)) {
+        idsProcessados.add(id);
+        lojasMap[id] = nome;
+      }
+    }
+
+    final lista =
+        lojasMap.entries
+            .map((entry) => {'id': entry.key, 'nome': entry.value})
+            .toList()
+          ..sort((a, b) => a['nome']!.compareTo(b['nome']!));
+
+    return lista;
+  }
+
+  // -------------------------------------------------------------------------
+  // 3.12 MÉTODO: FILTRAR PEDIDOS (COM LOADING)
+  // -------------------------------------------------------------------------
+  Future<void> _filtrarPedidos() async {
+    setState(() {
+      _isLoading = true; // ✅ Mostrar loading durante filtro
+      _pedidosSelecionados.clear(); // ✅ Limpar seleção ao filtrar
+    });
+
+    try {
+      var query = Supabase.instance.client
+          .from('pedidos')
+          .select('*')
+          .eq('status_transporte', 'entregue');
+
+      // Aplica filtros se não vazios
+      if (_filtroEntregador.text.isNotEmpty) {
+        query = query.ilike(
+          'aceito_por_nome',
+          '%${_filtroEntregador.text}%',
+        ); // Busca parcial no nome do entregador
+      }
+      if (_filtroLoja.text.isNotEmpty) {
+        query = query.eq(
+          'id_loja',
+          _filtroLoja.text,
+        ); // Filtro exato pelo ID da loja
+      }
+      if (_filtroStatus.text.isNotEmpty) {
+        final statusBool = bool.parse(
+          _filtroStatus.text,
+        ); // Converte 'true'/'false' para booleano
+        query = query.eq('status_pagamento', statusBool);
+      }
+
+      // Executa a query filtrada
+      final response = await query;
+      _pedidos = response.map((json) => Pedido.fromJson(json)).toList();
+      _calcularTotais();
+
+      // ✅ Resetar filtros inválidos após atualizar _pedidos
+      // Para Loja: Se o value atual não existe mais nas lojas únicas, resetar para 'Todas'
+      if (_filtroLoja.text.isNotEmpty &&
+          !_lojasUnicas.any((loja) => loja['id'] == _filtroLoja.text)) {
+        _filtroLoja.text = '';
+      }
+
+      // Para Status: Opcional - resetar se zero resultados e filtro ativo (mas items são fixos, então não crasha dropdown)
+      if (_pedidos.isEmpty && _filtroStatus.text.isNotEmpty) {
+        // _filtroStatus.text = ''; // Descomente se quiser resetar automaticamente
+      }
+
+      // Para Entregador: Se zero resultados, opcional limpar o texto, mas não necessário (não causa crash)
+      if (_pedidos.isEmpty && _filtroEntregador.text.isNotEmpty) {
+        // _filtroEntregador.text = ''; // Descomente se quiser resetar
+      }
+
+      // ✅ DEBUG: Verificar se há duplicatas reais
+      _verificarDuplicatasLojas();
+    } catch (e) {
+      if (mounted) {
+        ScaffoldMessenger.of(
+          context,
+        ).showSnackBar(SnackBar(content: Text('Erro ao filtrar: $e')));
+      }
+    } finally {
+      setState(() {
+        _isLoading = false; // ✅ Esconder loading após filtro
+      });
+    }
+  }
+
+  // -------------------------------------------------------------------------
+  // 3.13 MÉTODO: GERAR RECIBO EM PDF
+  // -------------------------------------------------------------------------
+  Future<void> _gerarRecibo() async {
+    if (_pedidosSelecionados.isEmpty) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('Selecione pelo menos um pedido.')),
+        );
+      }
+      return;
+    }
+
+    try {
+      final fontData = await rootBundle.load('assets/fonts/Roboto-Regular.ttf');
+      final ttf = pw.Font.ttf(fontData);
+      final pdf = pw.Document(theme: pw.ThemeData.withFont(base: ttf));
+
+      final pedidosFiltrados = _pedidos
+          .where((p) => _pedidosSelecionados.contains(p.id))
+          .toList();
+
+      // Detecta se é entregador (várias lojas) ou gerente (vários entregadores)
+      final Set<String> lojas = pedidosFiltrados.map((p) => p.lojaNome).toSet();
+
+      Map<String, List<Pedido>> grupos = {};
+
+      if (lojas.length > 1) {
+        // ✅ É entregador: agrupa por loja
+        for (final pedido in pedidosFiltrados) {
+          final key = pedido.lojaNome;
+          grupos[key] ??= [];
+          grupos[key]!.add(pedido);
+        }
+      } else {
+        // ✅ É gerente: agrupa por entregador
+        for (final pedido in pedidosFiltrados) {
+          final key = pedido.aceitoPorNome ?? 'Não informado';
+          grupos[key] ??= [];
+          grupos[key]!.add(pedido);
+        }
+      }
+
+      // Cria uma página para cada grupo
+      for (final grupo in grupos.entries) {
+        final pedidos = grupo.value;
+        // Carrega o logo da loja
+        final logoBytes = await _carregarLogoDaLoja(pedidos.first);
+
+        pdf.addPage(
+          pw.Page(
+            build: (context) {
+              return pw.Center(
+                child: pw.Column(
+                  crossAxisAlignment: pw.CrossAxisAlignment.start,
+                  children: [
+                    if (logoBytes != null)
+                      pw.Container(
+                        width: 80,
+                        height: 80,
+                        child: pw.Image(pw.MemoryImage(logoBytes)),
+                      ),
+                    pw.SizedBox(width: 20),
+                    pw.Text(
+                      'Relatório de Fretes - Data: ${DateFormat('dd/MM/yyyy').format(DateTime.now())}',
+                      style: pw.TextStyle(
+                        fontSize: 16,
+                        fontWeight: pw.FontWeight.bold,
+                      ),
+                    ),
+                    pw.SizedBox(height: 10),
+                    pw.Text('Entregador: ${pedidos.first.aceitoPorNome}'),
+                    pw.Text('Empresa: ${pedidos.first.lojaNome}'),
+                    pw.SizedBox(height: 20),
+                    pw.Text(
+                      'Pedidos entregues:',
+                      style: pw.TextStyle(
+                        fontSize: 14,
+                        fontWeight: pw.FontWeight.bold,
+                      ),
+                    ),
+                    pw.SizedBox(height: 10),
+                    for (var pedido in pedidos)
+                      pw.Row(
+                        children: [
+                          pw.Text(
+                            '- ${pedido.idLojaWoo}',
+                            style: pw.TextStyle(fontSize: 12),
+                          ),
+                          pw.SizedBox(width: 10),
+                          pw.Text('|', style: pw.TextStyle(fontSize: 12)),
+                          pw.SizedBox(width: 10),
+                          pw.Text(
+                            'R\$ ${pedido.fretePago?.toStringAsFixed(2) ?? '0.00'}',
+                            style: pw.TextStyle(fontSize: 12),
+                          ),
+                        ],
+                      ),
+                    pw.SizedBox(height: 10),
+                    pw.Text(
+                      'Total: R\$ ${pedidos.fold(0.0, (sum, p) => sum + (p.fretePago ?? 0.0)).toStringAsFixed(2)}',
+                      style: pw.TextStyle(
+                        fontSize: 14,
+                        fontWeight: pw.FontWeight.bold,
+                      ),
+                    ),
+                    pw.SizedBox(height: 30),
+                    pw.Text(
+                      'Assinatura do Responsável: _________',
+                      style: pw.TextStyle(fontSize: 12),
+                    ),
+                  ],
+                ),
+              );
+            },
+          ),
+        );
+      }
+
+      // Salva ou abre o PDF
+      final bytes = await pdf.save();
+
+      if (kIsWeb) {
+        final blob = base64Encode(bytes);
+        final url = 'data:application/pdf;base64,$blob';
+        final uri = Uri.parse(url);
+        await launchUrl(uri);
+      } else {
+        final directory = await getApplicationDocumentsDirectory();
+        final file = File('${directory.path}/recibo_pedidos.pdf');
+        await file.writeAsBytes(bytes);
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            const SnackBar(content: Text('Recibo gerado com sucesso!')),
+          );
+        }
+      }
+    } catch (e) {
+      if (mounted) {
+        ScaffoldMessenger.of(
+          context,
+        ).showSnackBar(SnackBar(content: Text('Erro ao gerar PDF: $e')));
+      }
+    }
+  }
+
+  // -------------------------------------------------------------------------
+  // 3.15 MÉTODO: CARREGAR LOGO DA LOJA
+  // -------------------------------------------------------------------------
+  /// Carrega o logo da loja a partir do campo `loja_logo` no modelo `Pedido`
+  Future<Uint8List?> _carregarLogoDaLoja(Pedido pedido) async {
+    try {
+      // Verifica se a URL do logo é válida
+      if (pedido.lojaLogo == null || pedido.lojaLogo!.isEmpty) {
+        return null;
+      }
+
+      // ✅ FAZ DOWNLOAD DA IMAGEM (retorna Uint8List)
+      final response = await http.get(Uri.parse(pedido.lojaLogo!));
+
+      if (response.statusCode == 200) {
+        return response.bodyBytes;
+      } else {
+        debugPrint('Erro ao carregar logo: Status ${response.statusCode}');
+        return null;
+      }
+    } catch (e) {
+      debugPrint('Erro ao carregar logo: $e');
+      return null;
+    }
+  }
+
+  // -------------------------------------------------------------------------
+  // 3.14 MÉTODO: CONSTRUIR A INTERFACE (WIDGET TREE)
+  // -------------------------------------------------------------------------
+  /// Constrói a interface gráfica da tela "Pedidos Entregues"
+  ///
+  /// Componentes principais:
+  /// - Filtros (entregador, loja, status pagamento)
+  /// - Campo de data de pagamento (com calendário)
+  /// - Botões: Atualizar, Gerar Recibo
+  /// - Lista de pedidos com seleção e detalhes
+  @override
+  Widget build(BuildContext context) {
+    // ╔══════════════════════════════════════════════════════════════════╗
+    // ║                      INÍCIO: SCAFFOLD                            ║
+    // ╚══════════════════════════════════════════════════════════════════╝
+    return Scaffold(
+      appBar: AppBar(title: const Text('Pedidos Entregues')),
+      body: Padding(
+        padding: const EdgeInsets.all(16),
+        child: Column(
+          children: [
+            // ╔══════════════════════════════════════════════════════════════════╗
+            // ║                         FILTRO: ENTREGADOR (NOVO)                ║
+            // ╚══════════════════════════════════════════════════════════════════╝
+            TextFormField(
+              controller: _filtroEntregador,
+              decoration: const InputDecoration(labelText: 'Entregador'),
+              onChanged: (value) async {
+                await _filtrarPedidos(); // ✅ Filtra dinamicamente a cada mudança
+                setState(
+                  () {},
+                ); // ✅ Força rebuild após filtro (opcional, mas consistente com outros)
+              },
+            ),
+
+            // ╔══════════════════════════════════════════════════════════════════╗
+            // ║                         FILTRO: LOJA (CORRIGIDO)                 ║
+            // ╚══════════════════════════════════════════════════════════════════╝
+            DropdownButtonFormField<String>(
+              value: _filtroLoja.text.isEmpty ? null : _filtroLoja.text,
+              items: [
+                const DropdownMenuItem(
+                  value: '',
+                  child: Text('Todas as Lojas'),
+                ),
+                // ✅ CORRIGIDO: Removido .toList() desnecessário
+                ..._lojasUnicas.map(
+                  (loja) => DropdownMenuItem(
+                    value: loja['id']!,
+                    child: Text(loja['nome']!),
+                  ),
+                ),
+              ],
+              onChanged: (value) async {
+                setState(() {
+                  _filtroLoja.text = value ?? '';
+                });
+                await _filtrarPedidos();
+                setState(() {});
+              },
+              decoration: const InputDecoration(labelText: 'Loja'),
+            ),
+            // ╔══════════════════════════════════════════════════════════════════╗
+            // ║                   FILTRO: STATUS PAGAMENTO (CORRIGIDO)          ║
+            // ╚══════════════════════════════════════════════════════════════════╝
+            DropdownButtonFormField<String>(
+              value: _filtroStatus.text.isEmpty ? null : _filtroStatus.text,
+              items: [
+                const DropdownMenuItem(value: '', child: Text('Todos')),
+                const DropdownMenuItem(value: 'true', child: Text('Pago')),
+                const DropdownMenuItem(value: 'false', child: Text('Pendente')),
+              ],
+              onChanged: (value) async {
+                setState(() {
+                  _filtroStatus.text = value ?? '';
+                });
+                await _filtrarPedidos(); // ✅ Aguardar o filtro completar
+                setState(() {}); // ✅ Forçar rebuild após filtro
+              },
+              decoration: const InputDecoration(labelText: 'Status Pagamento'),
+            ),
+            // ╔══════════════════════════════════════════════════════════════════╗
+            // ║                  LINHA: DATA + BOTÕES                            ║
+            // ╚══════════════════════════════════════════════════════════════════╝
+            Row(
+              children: [
+                // --- CAMPO: DATA DE PAGAMENTO ---
+                Expanded(
+                  child: TextFormField(
+                    controller: _dataPagamentoController,
+                    decoration: InputDecoration(
+                      labelText: 'Data do Pagamento',
+                      suffixIcon: IconButton(
+                        icon: const Icon(Icons.calendar_today),
+                        onPressed: () async {
+                          final now = DateTime.now();
+                          final picked = await showDatePicker(
+                            context: context,
+                            initialDate: _dataPagamento,
+                            firstDate: DateTime(2020),
+                            lastDate: now,
+                          );
+                          if (picked != null) {
+                            setState(() {
+                              _dataPagamento = picked;
+                              _dataPagamentoController.text = DateFormat(
+                                'dd/MM/yyyy',
+                              ).format(picked);
+                            });
+                          }
+                        },
+                      ),
+                    ),
+                    onTap: () async {
+                      final now = DateTime.now();
+                      final picked = await showDatePicker(
+                        context: context,
+                        initialDate: _dataPagamento,
+                        firstDate: DateTime(2020),
+                        lastDate: now,
+                      );
+                      if (picked != null) {
+                        setState(() {
+                          _dataPagamento = picked;
+                          _dataPagamentoController.text = DateFormat(
+                            'dd/MM/yyyy',
+                          ).format(picked);
+                        });
+                      }
+                    },
+                    readOnly: true,
+                  ),
+                ),
+                const SizedBox(width: 8),
+
+                // --- ESPAÇO: BOTÃO FILTRAR (removido) ---
+                const SizedBox(width: 8),
+
+                // --- BOTÃO: ATUALIZAR ---
+                ElevatedButton(
+                  onPressed: _atualizarPedidos,
+                  child: const Text('Atualizar'),
+                ),
+                const SizedBox(width: 8),
+
+                // --- BOTÃO: GERAR RECIBO ---
+                ElevatedButton(
+                  onPressed: () async {
+                    await _gerarRecibo();
+                  },
+                  child: const Text('Gerar Recibo'),
+                ),
+              ],
+            ),
+            // Dentro do método build(), na Column principal (após os filtros existentes):
+            // ... (filtros de Entregador, Loja, Status Pagamento já adicionados)
+
+            // Em seguida, os contadores e a lista:
+            const SizedBox(height: 16),
+
+            // ╔══════════════════════════════════════════════════════════════════╗
+            // ║                     CONTADORES                                   ║
+            // ╚══════════════════════════════════════════════════════════════════╝
+            Text('Selecionados: ${_pedidosSelecionados.length}'),
+            const SizedBox(height: 8),
+            Text(
+              'Total Selecionados: R\$ ${_totalSelecionados.toStringAsFixed(2)}',
+            ),
+            const SizedBox(height: 8),
+            // Remove o Total Geral
+            const SizedBox(height: 16),
+
+            // ╔══════════════════════════════════════════════════════════════════╗
+            // ║                     LISTA DE PEDIDOS                             ║
+            // ╚══════════════════════════════════════════════════════════════════╝
+            Expanded(
+              child: _isLoading
+                  ? const Center(child: CircularProgressIndicator())
+                  : _pedidos.isEmpty
+                  ? const Center(child: Text('Nenhum pedido encontrado.'))
+                  : ListView.builder(
+                      itemCount: _pedidos.length,
+                      itemBuilder: (context, index) {
+                        // Proteção contra índice inválido
+                        if (index >= _pedidos.length) {
+                          return const SizedBox();
+                        }
+
+                        final pedido = _pedidos[index];
+                        return Card(
+                          child: ListTile(
+                            leading: Row(
+                              mainAxisSize: MainAxisSize.min,
+                              children: [
+                                Checkbox(
+                                  value: _pedidosSelecionados.contains(
+                                    pedido.id,
+                                  ),
+                                  onChanged: (value) {
+                                    setState(() {
+                                      if (value == true) {
+                                        _pedidosSelecionados.add(pedido.id);
+                                      } else {
+                                        _pedidosSelecionados.remove(pedido.id);
+                                      }
+                                      _calcularTotais();
+                                    });
+                                  },
+                                ),
+                                Text(
+                                  pedido.idLojaWoo,
+                                  style: const TextStyle(
+                                    fontWeight: FontWeight.bold,
+                                    fontSize: 16,
+                                  ),
+                                ),
+                              ],
+                            ),
+                            title: Text(
+                              pedido.lojaNome,
+                              style: const TextStyle(
+                                fontSize: 14,
+                                color: Colors.blue,
+                              ),
+                            ),
+                            subtitle: Column(
+                              crossAxisAlignment: CrossAxisAlignment.start,
+                              children: [
+                                if (pedido.aceitoPorNome != null)
+                                  Text('Entregador: ${pedido.aceitoPorNome}'),
+                                const SizedBox(height: 4),
+                                if (pedido.dataPagamento != null)
+                                  Text(
+                                    'Pago em: ${DateFormat('dd/MM/yyyy').format(pedido.dataPagamento!)}',
+                                    style: const TextStyle(fontSize: 12),
+                                  ),
+                                const SizedBox(height: 4),
+                                Row(
+                                  children: [
+                                    Text('Pagamento: '),
+                                    Icon(
+                                      pedido.statusPagamento
+                                          ? Icons.check_circle
+                                          : Icons.cancel,
+                                      size: 14,
+                                      color: pedido.statusPagamento
+                                          ? Colors.green
+                                          : Colors.red,
+                                    ),
+                                    const SizedBox(width: 4),
+                                    Text(
+                                      pedido.statusPagamento
+                                          ? 'Pago'
+                                          : 'Pendente',
+                                      style: TextStyle(
+                                        fontSize: 12,
+                                        color: pedido.statusPagamento
+                                            ? Colors.green
+                                            : Colors.red,
+                                      ),
+                                    ),
+                                  ],
+                                ),
+                                const SizedBox(height: 4),
+                                Row(
+                                  children: [
+                                    const Text('Frete Pago: R\$ '),
+                                    SizedBox(
+                                      width: 100,
+                                      child: TextField(
+                                        controller: _getFreteController(pedido),
+                                        keyboardType:
+                                            const TextInputType.numberWithOptions(
+                                              decimal: true,
+                                            ),
+                                        decoration: const InputDecoration(
+                                          border: OutlineInputBorder(),
+                                          contentPadding: EdgeInsets.symmetric(
+                                            horizontal: 4,
+                                            vertical: 2,
+                                          ),
+                                          isDense: true,
+                                        ),
+                                        style: const TextStyle(fontSize: 12),
+                                        onChanged: (value) {
+                                          _calcularTotais(); // Atualiza totais ao editar o valor
+                                        },
+                                      ),
+                                    ),
+                                  ],
+                                ),
+                              ],
+                            ),
+                            onTap: () {
+                              _mostrarDetalhesPedido(context, pedido);
+                            },
+                          ),
+                        );
+                      },
+                    ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  // ╔══════════════════════════════════════════════════════════════════╗
+  // ║                      FIM: SCAFFOLD                               ║
+  // ╚════
+  // ══════════════════════════════════════════════════════════════╝
+
+  // -------------------------------------------------------------------------
+  // 3.15 MÉTODO: MOSTRAR DETALHES DO PEDIDO
+  // -------------------------------------------------------------------------
+  void _mostrarDetalhesPedido(BuildContext context, Pedido pedido) {
+    showDialog(
+      context: context,
+      builder: (context) {
+        return AlertDialog(
+          title: Text(pedido.lojaNome),
+          content: SingleChildScrollView(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Text('ID: ${pedido.id}'),
+                Text('Pedido: ${pedido.idLojaWoo}'),
+                Text(
+                  'Data: ${DateFormat('dd/MM/yyyy HH:mm:ss').format(pedido.data ?? DateTime.now())}',
+                ),
+                const SizedBox(height: 8),
+                Text('Cliente: ${pedido.nomeCliente ?? 'Não informado'}'),
+                Text('Telefone: ${pedido.telefoneCliente ?? 'Não informado'}'),
+                Text('Email: ${pedido.emailCliente ?? 'Não informado'}'),
+                const SizedBox(height: 8),
+                Text('Endereço de Entrega:'),
+                Text(
+                  pedido.enderecoEntrega ?? 'Não informado',
+                  style: const TextStyle(fontSize: 12),
+                ),
+                const SizedBox(height: 8),
+                Text('Produtos:'),
+                _formatarProdutos(pedido.produto),
+                const SizedBox(height: 8),
+                if (pedido.observacaoPedido?.isNotEmpty == true)
+                  Text('Observação: ${pedido.observacaoPedido}'),
+                Text(
+                  'Forma de Pagamento: ${pedido.formaPagamento ?? 'Não informado'}',
+                ),
+                Text('Status: ${pedido.statusTransporte}'),
+                const SizedBox(height: 4),
+                Text(
+                  'Telefone da Loja: ${pedido.lojaTelefone ?? 'Não informado'}',
+                ),
+                const SizedBox(height: 8),
+                if (pedido.aceitoPorNome != null)
+                  Text('Nome Entregador: ${pedido.aceitoPorNome}'),
+                if (pedido.aceitoPorTelefone != null)
+                  Text('Tel. Entregador: ${pedido.aceitoPorTelefone}'),
+                if (pedido.aceitoPorEmail != null)
+                  Text('Email Entregador: ${pedido.aceitoPorEmail}'),
+              ],
+            ),
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(context),
+              child: const Text('Fechar'),
+            ),
+          ],
+        );
+      },
+    );
+  }
+
+  // -------------------------------------------------------------------------
+  // 3.16 MÉTODO: OBTER OU CRIAR CONTROLLER DE FRETE
+  // -------------------------------------------------------------------------
+
+  /// Formata a lista de produtos em múltiplas linhas
+  Widget _formatarProdutos(String? produto) {
+    if (produto == null || produto.isEmpty) {
+      return const Text('-');
+    }
+
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: produto.split(', ').map((item) {
+        final parts = item.split(' (');
+        final nome = parts[0];
+        final quantidade = parts.length > 1 ? parts[1].replaceAll(')', '') : '';
+        return Text(
+          '- $nome - $quantidade unidade${quantidade != '1' ? 's' : ''}',
+          style: const TextStyle(fontSize: 12),
+        );
+      }).toList(),
+    );
+  }
+}
